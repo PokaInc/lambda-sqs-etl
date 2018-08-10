@@ -1,0 +1,183 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+
+Parameters:
+  SourceBucket:
+    Type: String
+
+  DestinationBucket:
+    Type: String
+
+Resources:
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+              - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+      - PolicyName: S3Access
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:GetObject
+            - s3:ListBucket
+            Resource:
+            - !Sub arn:aws:s3:::${SourceBucket}
+            - !Sub arn:aws:s3:::${SourceBucket}/*
+          - Effect: Allow
+            Action:
+            - s3:PutObject
+            Resource: !Sub arn:aws:s3:::${DestinationBucket}/*
+      - PolicyName: 'SQSAccess'
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - sqs:SendMessage*
+            - sqs:DeleteMessage
+            - sqs:ChangeMessageVisibility
+            - sqs:ReceiveMessage
+            - sqs:GetQueueAttributes
+            Resource:
+            - !GetAtt PagesQueue.Arn
+            - !GetAtt S3ObjectsQueue.Arn
+      - PolicyName: CloudwatchAccess
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - cloudwatch:PutMetricData
+            Resource:
+            - "*"
+
+  StatesExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - !Sub states.${AWS::Region}.amazonaws.com
+          Action: sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: StatesExecutionPolicy
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: Allow
+            Action:
+            - lambda:InvokeFunction
+            Resource:
+            - !GetAtt ListPagesLambdaFunction.Arn
+
+  StateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt StatesExecutionRole.Arn
+      DefinitionString: !Sub |-
+        {
+          "Comment": "State machine that will list pages in a S3 bucket and put each page as a message in the Pages SQS queue",
+          "StartAt": "ListPages",
+          "States": {
+            "ListPages": {
+              "Type": "Task",
+              "Resource": "${ListPagesLambdaFunction.Arn}",
+              "Next": "CheckIfAllPagesListed"
+            },
+            "CheckIfAllPagesListed": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.all_pages_listed",
+                  "StringEquals": "TRUE",
+                  "Next": "SuccessState"
+                }
+              ],
+              "Default": "ListPages"
+            },
+            "SuccessState": {
+              "Type": "Succeed"
+            }
+          }
+        }
+
+  PagesQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeout: 300  # 5 minutes
+
+  S3ObjectsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeout: 300  # 5 minutes
+
+  PagesEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt PagesQueue.Arn
+      FunctionName: !Ref SplitPageLambdaFunction
+      BatchSize: 1  # only 1 page at at a time. Larger than that, and we might exceed the 5 minutes limit for the Lambda execution
+
+  S3ObjectsEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt S3ObjectsQueue.Arn
+      FunctionName: !Ref TransformLambdaFunction
+      BatchSize: 10
+
+  ListPagesLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code: lambda_sqs_etl.py
+      Handler: lambda_sqs_etl.handler_list_pages
+      Runtime: python3.6
+      Timeout: 300
+      Environment:
+        Variables:
+          SOURCE_BUCKET_NAME: !Ref SourceBucket
+          PAGES_SQS_QUEUE_URL: !Ref PagesQueue
+
+  SplitPageLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code: lambda_sqs_etl.py
+      Handler: lambda_sqs_etl.handler_split_page
+      Runtime: python3.6
+      Timeout: 300
+      Environment:
+        Variables:
+          S3_OBJECTS_SQS_QUEUE_URL: !Ref S3ObjectsQueue
+
+  TransformLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code: lambda_sqs_etl.py
+      Handler: lambda_sqs_etl.handler_transform
+      Runtime: python3.6
+      Timeout: 300
+      Environment:
+        Variables:
+          SOURCE_BUCKET_NAME: !Ref SourceBucket
+          DESTINATION_BUCKET_NAME: !Ref DestinationBucket
